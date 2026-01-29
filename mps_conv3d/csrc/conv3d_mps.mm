@@ -394,12 +394,10 @@ torch::Tensor conv3d_forward_mps(
     auto input_contig = input.contiguous();
     auto weight_contig = weight.contiguous();
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         bool is_fp16 = input_contig.scalar_type() == torch::kHalf;
         id<MTLComputePipelineState> pso = is_fp16 ? g_conv3d_forward_fp16 : g_conv3d_forward_fp32;
@@ -436,9 +434,7 @@ torch::Tensor conv3d_forward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        [encoder endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return output;
@@ -474,12 +470,10 @@ torch::Tensor conv3d_backward_input_mps(
     auto weight_f = weight.to(torch::kFloat32).contiguous();
     auto grad_input = torch::zeros({batch, in_channels, in_depth, in_height, in_width}, grad_output_f.options());
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_conv3d_backward_input_fp32];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
@@ -513,9 +507,7 @@ torch::Tensor conv3d_backward_input_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        [encoder endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return grad_input.to(grad_output.scalar_type());
@@ -551,12 +543,10 @@ torch::Tensor conv3d_backward_weight_mps(
     auto input_f = input.to(torch::kFloat32).contiguous();
     auto grad_weight = torch::zeros(weight_shape, grad_output_f.options());
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_conv3d_backward_weight_fp32];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
@@ -590,9 +580,7 @@ torch::Tensor conv3d_backward_weight_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        [encoder endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return grad_weight.to(grad_output.scalar_type());
