@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "torch>=2.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mps-conv3d"
+version = "0.1.0"
+description = "3D Convolution for Apple Silicon (MPS)"
+readme = "README.md"
+license = "MIT"
+authors = [{name = "mpsops"}]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.0.0"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["pytorch", "mps", "apple-silicon", "conv3d", "video", "3d-convolution"]
+
+[project.urls]
+Homepage = "https://github.com/mpsops/mps-conv3d"
+Repository = "https://github.com/mpsops/mps-conv3d"
+Issues = "https://github.com/mpsops/mps-conv3d/issues"
