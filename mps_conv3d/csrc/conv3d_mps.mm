@@ -2,6 +2,7 @@
 // Used in video models: Synchformer, I3D, SlowFast, C3D, etc.
 
 #include <torch/extension.h>
+#include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
@@ -182,6 +183,7 @@ kernel void conv3d_forward_fp16(
 }
 
 // Backward for input - transposed convolution
+// Note: Uses atomic_float, no atomic_half in Metal, so backward always FP32
 kernel void conv3d_backward_input_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -389,23 +391,41 @@ torch::Tensor conv3d_forward_mps(
     int out_height = (in_height + 2 * pad_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
     int out_width = (in_width + 2 * pad_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
 
-    auto output = torch::zeros({batch, out_channels, out_depth, out_height, out_width}, input.options());
+    // Handle BF16: convert to FP32 for kernel, convert output back
+    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
+    at::ScalarType orig_dtype = input.scalar_type();
 
-    auto input_contig = input.contiguous();
-    auto weight_contig = weight.contiguous();
+    auto input_work = input.contiguous();
+    auto weight_work = weight.contiguous();
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Convert BF16 to FP32 for kernel execution
+    if (is_bfloat16) {
+        input_work = input_work.to(at::kFloat);
+        weight_work = weight_work.to(at::kFloat);
+    }
+
+    auto output = torch::zeros({batch, out_channels, out_depth, out_height, out_width}, input_work.options());
+
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_work);
+    id<MTLBuffer> weight_buf = at::native::mps::getMTLBufferStorage(weight_work);
+    id<MTLBuffer> output_buf = at::native::mps::getMTLBufferStorage(output);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool is_fp16 = input_contig.scalar_type() == torch::kHalf;
-        id<MTLComputePipelineState> pso = is_fp16 ? g_conv3d_forward_fp16 : g_conv3d_forward_fp32;
+        bool use_fp16 = input_work.scalar_type() == at::kHalf;
+        id<MTLComputePipelineState> pso = use_fp16 ? g_conv3d_forward_fp16 : g_conv3d_forward_fp32;
 
         [encoder setComputePipelineState:pso];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input_contig) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_contig) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:2];
+        [encoder setBuffer:input_buf
+                    offset:input_work.storage_offset() * input_work.element_size() atIndex:0];
+        [encoder setBuffer:weight_buf
+                    offset:weight_work.storage_offset() * weight_work.element_size() atIndex:1];
+        [encoder setBuffer:output_buf
+                    offset:output.storage_offset() * output.element_size() atIndex:2];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&in_channels length:sizeof(int) atIndex:4];
@@ -434,7 +454,12 @@ torch::Tensor conv3d_forward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert output back to original dtype (BF16)
+    if (is_bfloat16) {
+        output = output.to(orig_dtype);
     }
 
     return output;
@@ -466,19 +491,27 @@ torch::Tensor conv3d_backward_input_mps(
     int kernel_h = weight.size(3);
     int kernel_w = weight.size(4);
 
-    auto grad_output_f = grad_output.to(torch::kFloat32).contiguous();
-    auto weight_f = weight.to(torch::kFloat32).contiguous();
+    // Backward always uses FP32 kernel (Metal doesn't have atomic_half)
+    at::ScalarType orig_dtype = grad_output.scalar_type();
+
+    auto grad_output_f = grad_output.to(at::kFloat).contiguous();
+    auto weight_f = weight.to(at::kFloat).contiguous();
     auto grad_input = torch::zeros({batch, in_channels, in_depth, in_height, in_width}, grad_output_f.options());
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> grad_out_buf = at::native::mps::getMTLBufferStorage(grad_output_f);
+    id<MTLBuffer> weight_buf = at::native::mps::getMTLBufferStorage(weight_f);
+    id<MTLBuffer> grad_input_buf = at::native::mps::getMTLBufferStorage(grad_input);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_conv3d_backward_input_fp32];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_f) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_input) offset:0 atIndex:2];
+        [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
+        [encoder setBuffer:weight_buf offset:weight_f.storage_offset() * weight_f.element_size() atIndex:1];
+        [encoder setBuffer:grad_input_buf offset:grad_input.storage_offset() * grad_input.element_size() atIndex:2];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&in_channels length:sizeof(int) atIndex:4];
@@ -507,10 +540,10 @@ torch::Tensor conv3d_backward_input_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
-    return grad_input.to(grad_output.scalar_type());
+    return grad_input.to(orig_dtype);
 }
 
 torch::Tensor conv3d_backward_weight_mps(
@@ -539,19 +572,27 @@ torch::Tensor conv3d_backward_weight_mps(
     int kernel_h = weight_shape[3];
     int kernel_w = weight_shape[4];
 
-    auto grad_output_f = grad_output.to(torch::kFloat32).contiguous();
-    auto input_f = input.to(torch::kFloat32).contiguous();
+    // Backward always uses FP32 kernel (Metal doesn't have atomic_half)
+    at::ScalarType orig_dtype = grad_output.scalar_type();
+
+    auto grad_output_f = grad_output.to(at::kFloat).contiguous();
+    auto input_f = input.to(at::kFloat).contiguous();
     auto grad_weight = torch::zeros(weight_shape, grad_output_f.options());
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> grad_out_buf = at::native::mps::getMTLBufferStorage(grad_output_f);
+    id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_f);
+    id<MTLBuffer> grad_weight_buf = at::native::mps::getMTLBufferStorage(grad_weight);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_conv3d_backward_weight_fp32];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input_f) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_weight) offset:0 atIndex:2];
+        [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
+        [encoder setBuffer:input_buf offset:input_f.storage_offset() * input_f.element_size() atIndex:1];
+        [encoder setBuffer:grad_weight_buf offset:grad_weight.storage_offset() * grad_weight.element_size() atIndex:2];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&in_channels length:sizeof(int) atIndex:4];
@@ -580,10 +621,10 @@ torch::Tensor conv3d_backward_weight_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
-    return grad_weight.to(grad_output.scalar_type());
+    return grad_weight.to(orig_dtype);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

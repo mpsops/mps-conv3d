@@ -11,7 +11,7 @@ from torch.autograd import Function
 from typing import Optional, Tuple, Union
 import torch.nn.functional as F
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 def _load_library():
