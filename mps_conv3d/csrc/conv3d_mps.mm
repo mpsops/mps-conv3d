@@ -19,6 +19,23 @@ static const char* METAL_SHADER = R"(
 #include <metal_stdlib>
 using namespace metal;
 
+// Atomic float add using compare-and-swap (works on all Metal versions)
+// This is the standard workaround when atomic_float is not available
+inline void atomic_add_float(device atomic_uint* addr, float value) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    float current_val = as_type<float>(expected);
+    float new_val = current_val + value;
+    uint new_bits = as_type<uint>(new_val);
+
+    while (!atomic_compare_exchange_weak_explicit(
+        addr, &expected, new_bits,
+        memory_order_relaxed, memory_order_relaxed)) {
+        current_val = as_type<float>(expected);
+        new_val = current_val + value;
+        new_bits = as_type<uint>(new_val);
+    }
+}
+
 // Conv3D forward kernel
 // input: (N, C_in, D, H, W)
 // weight: (C_out, C_in/groups, kD, kH, kW)
@@ -267,7 +284,7 @@ kernel void conv3d_forward_bf16(
 kernel void conv3d_backward_input_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* weight [[buffer(1)]],
-    device atomic_float* grad_input [[buffer(2)]],
+    device atomic_uint* grad_input [[buffer(2)]],
     constant int& batch [[buffer(3)]],
     constant int& in_channels [[buffer(4)]],
     constant int& in_depth [[buffer(5)]],
@@ -333,7 +350,7 @@ kernel void conv3d_backward_input_fp32(
                     int input_idx = ((b * in_channels + actual_ic) * in_depth + id) * in_height * in_width +
                                    ih * in_width + iw;
 
-                    atomic_fetch_add_explicit(&grad_input[input_idx], grad_out_val * weight[weight_idx], memory_order_relaxed);
+                    atomic_add_float(&grad_input[input_idx], grad_out_val * weight[weight_idx]);
                 }
             }
         }
@@ -344,7 +361,7 @@ kernel void conv3d_backward_input_fp32(
 kernel void conv3d_backward_weight_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* input [[buffer(1)]],
-    device atomic_float* grad_weight [[buffer(2)]],
+    device atomic_uint* grad_weight [[buffer(2)]],
     constant int& batch [[buffer(3)]],
     constant int& in_channels [[buffer(4)]],
     constant int& in_depth [[buffer(5)]],
@@ -410,7 +427,7 @@ kernel void conv3d_backward_weight_fp32(
                     int weight_idx = ((oc * group_in_channels + ic) * kernel_d + kd) * kernel_h * kernel_w +
                                     kh * kernel_w + kw;
 
-                    atomic_fetch_add_explicit(&grad_weight[weight_idx], grad_out_val * input[input_idx], memory_order_relaxed);
+                    atomic_add_float(&grad_weight[weight_idx], grad_out_val * input[input_idx]);
                 }
             }
         }
