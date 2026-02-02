@@ -17,6 +17,7 @@ static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_im2col3d_fp32 = nil;
 static id<MTLComputePipelineState> g_im2col3d_fp16 = nil;
+static id<MTLComputePipelineState> g_im2col3d_bf16 = nil;
 static id<MTLComputePipelineState> g_col2im3d_fp32 = nil;
 
 // Helper to check for integer overflow
@@ -169,26 +170,78 @@ kernel void im2col3d_fp16(
     }
 }
 
-// col2im3d: Scatter column matrix back to image (for backward)
-// Atomic add since multiple output positions may write to same input
-inline void atomic_add_float(device atomic_uint* addr, float value) {
-    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
-    float current_val = as_type<float>(expected);
-    float new_val = current_val + value;
-    uint new_bits = as_type<uint>(new_val);
+// im2col3d BF16 - native bfloat16 with FP32 accumulation for precision
+kernel void im2col3d_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device bfloat* col [[buffer(1)]],
+    constant int& batch [[buffer(2)]],
+    constant int& in_channels [[buffer(3)]],
+    constant int& in_depth [[buffer(4)]],
+    constant int& in_height [[buffer(5)]],
+    constant int& in_width [[buffer(6)]],
+    constant int& out_depth [[buffer(7)]],
+    constant int& out_height [[buffer(8)]],
+    constant int& out_width [[buffer(9)]],
+    constant int& kernel_d [[buffer(10)]],
+    constant int& kernel_h [[buffer(11)]],
+    constant int& kernel_w [[buffer(12)]],
+    constant int& stride_d [[buffer(13)]],
+    constant int& stride_h [[buffer(14)]],
+    constant int& stride_w [[buffer(15)]],
+    constant int& pad_d [[buffer(16)]],
+    constant int& pad_h [[buffer(17)]],
+    constant int& pad_w [[buffer(18)]],
+    constant int& dilation_d [[buffer(19)]],
+    constant int& dilation_h [[buffer(20)]],
+    constant int& dilation_w [[buffer(21)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int out_spatial = out_depth * out_height * out_width;
+    int total = batch * out_spatial;
+    if (int(gid) >= total) return;
 
-    while (!atomic_compare_exchange_weak_explicit(
-        addr, &expected, new_bits,
-        memory_order_relaxed, memory_order_relaxed)) {
-        current_val = as_type<float>(expected);
-        new_val = current_val + value;
-        new_bits = as_type<uint>(new_val);
+    int b = gid / out_spatial;
+    int spatial_idx = gid % out_spatial;
+    int od = spatial_idx / (out_height * out_width);
+    int oh = (spatial_idx / out_width) % out_height;
+    int ow = spatial_idx % out_width;
+
+    int col_width = in_channels * kernel_d * kernel_h * kernel_w;
+    int col_row = gid;
+
+    int input_batch_offset = b * in_channels * in_depth * in_height * in_width;
+
+    int col_idx = 0;
+    for (int ic = 0; ic < in_channels; ic++) {
+        for (int kd = 0; kd < kernel_d; kd++) {
+            int id = od * stride_d - pad_d + kd * dilation_d;
+            for (int kh = 0; kh < kernel_h; kh++) {
+                int ih = oh * stride_h - pad_h + kh * dilation_h;
+                for (int kw = 0; kw < kernel_w; kw++) {
+                    int iw = ow * stride_w - pad_w + kw * dilation_w;
+
+                    bfloat val = bfloat(0);
+                    if (id >= 0 && id < in_depth && ih >= 0 && ih < in_height && iw >= 0 && iw < in_width) {
+                        int input_idx = input_batch_offset +
+                                       ic * in_depth * in_height * in_width +
+                                       id * in_height * in_width +
+                                       ih * in_width + iw;
+                        val = input[input_idx];
+                    }
+
+                    col[col_row * col_width + col_idx] = val;
+                    col_idx++;
+                }
+            }
+        }
     }
 }
 
+// col2im3d: Scatter column matrix back to image (for backward)
+// Uses native atomic_float for optimal performance on Apple Silicon
 kernel void col2im3d_fp32(
     device const float* col [[buffer(0)]],
-    device atomic_uint* output [[buffer(1)]],
+    device atomic_float* output [[buffer(1)]],
     constant int& batch [[buffer(2)]],
     constant int& in_channels [[buffer(3)]],
     constant int& in_depth [[buffer(4)]],
@@ -241,7 +294,7 @@ kernel void col2im3d_fp32(
                                         id * in_height * in_width +
                                         ih * in_width + iw;
                         float val = col[col_row * col_width + col_idx];
-                        atomic_add_float(&output[output_idx], val);
+                        atomic_fetch_add_explicit(&output[output_idx], val, memory_order_relaxed);
                     }
                     col_idx++;
                 }
@@ -280,14 +333,17 @@ static void ensure_initialized() {
 
     id<MTLFunction> im2col_fp32 = [g_library newFunctionWithName:@"im2col3d_fp32"];
     id<MTLFunction> im2col_fp16 = [g_library newFunctionWithName:@"im2col3d_fp16"];
+    id<MTLFunction> im2col_bf16 = [g_library newFunctionWithName:@"im2col3d_bf16"];
     id<MTLFunction> col2im_fp32 = [g_library newFunctionWithName:@"col2im3d_fp32"];
 
     g_im2col3d_fp32 = [g_device newComputePipelineStateWithFunction:im2col_fp32 error:&error];
     g_im2col3d_fp16 = [g_device newComputePipelineStateWithFunction:im2col_fp16 error:&error];
+    g_im2col3d_bf16 = [g_device newComputePipelineStateWithFunction:im2col_bf16 error:&error];
     g_col2im3d_fp32 = [g_device newComputePipelineStateWithFunction:col2im_fp32 error:&error];
 
     TORCH_CHECK(g_im2col3d_fp32 != nil, "Failed to create im2col3d_fp32 pipeline");
     TORCH_CHECK(g_im2col3d_fp16 != nil, "Failed to create im2col3d_fp16 pipeline");
+    TORCH_CHECK(g_im2col3d_bf16 != nil, "Failed to create im2col3d_bf16 pipeline");
     TORCH_CHECK(g_col2im3d_fp32 != nil, "Failed to create col2im3d_fp32 pipeline");
 
     g_initialized.store(true, std::memory_order_release);
@@ -316,13 +372,8 @@ torch::Tensor im2col3d_mps(
     int col_height = batch * out_depth * out_height * out_width;
     int col_width = in_channels * kernel_d * kernel_h * kernel_w;
 
-    // Handle BF16: convert to FP32 for kernel (no native BF16 im2col kernel)
-    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
+    // Native support for FP32, FP16, BF16 - no conversion needed
     auto input_work = input.contiguous();
-    if (is_bfloat16) {
-        input_work = input_work.to(at::kFloat);
-    }
-
     auto col = torch::empty({col_height, col_width}, input_work.options());
 
     id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_work);
@@ -332,8 +383,15 @@ torch::Tensor im2col3d_mps(
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        id<MTLComputePipelineState> pso = (input_work.scalar_type() == at::kHalf)
-            ? g_im2col3d_fp16 : g_im2col3d_fp32;
+        // Select kernel based on dtype - native support for all types
+        id<MTLComputePipelineState> pso;
+        if (input_work.scalar_type() == at::kHalf) {
+            pso = g_im2col3d_fp16;
+        } else if (input_work.scalar_type() == at::kBFloat16) {
+            pso = g_im2col3d_bf16;
+        } else {
+            pso = g_im2col3d_fp32;
+        }
 
         [encoder setComputePipelineState:pso];
         [encoder setBuffer:input_buf offset:input_work.storage_offset() * input_work.element_size() atIndex:0];
@@ -364,11 +422,6 @@ torch::Tensor im2col3d_mps(
         NSUInteger threadGroupSize = std::min((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup);
         MTLSize tgSize = MTLSizeMake(threadGroupSize, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-    }
-
-    // Convert back to BF16 if needed
-    if (is_bfloat16) {
-        col = col.to(at::kBFloat16);
     }
 
     return col;
