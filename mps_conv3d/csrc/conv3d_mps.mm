@@ -6,12 +6,25 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
+#include <mutex>
+#include <atomic>
+
+// Thread-safe Metal state
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_initialized{false};
 
 static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_im2col3d_fp32 = nil;
 static id<MTLComputePipelineState> g_im2col3d_fp16 = nil;
 static id<MTLComputePipelineState> g_col2im3d_fp32 = nil;
+
+// Helper to check for integer overflow
+static void check_size_overflow(int64_t value, const char* name) {
+    constexpr int64_t INT32_LIMIT = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+    TORCH_CHECK(value <= INT32_LIMIT,
+        name, " (", value, ") exceeds int32 limit for Metal kernel dispatch");
+}
 
 static const char* METAL_SHADER = R"(
 #include <metal_stdlib>
@@ -239,9 +252,22 @@ kernel void col2im3d_fp32(
 )";
 
 static void ensure_initialized() {
-    if (g_device != nil) return;
+    // Fast path: already initialized
+    if (g_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Slow path: need to initialize
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Double-check after acquiring lock
+    if (g_initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
 
     g_device = MTLCreateSystemDefaultDevice();
+    TORCH_CHECK(g_device != nil, "Failed to create Metal device");
+
     NSError* error = nil;
 
     NSString* source = [NSString stringWithUTF8String:METAL_SHADER];
@@ -259,6 +285,12 @@ static void ensure_initialized() {
     g_im2col3d_fp32 = [g_device newComputePipelineStateWithFunction:im2col_fp32 error:&error];
     g_im2col3d_fp16 = [g_device newComputePipelineStateWithFunction:im2col_fp16 error:&error];
     g_col2im3d_fp32 = [g_device newComputePipelineStateWithFunction:col2im_fp32 error:&error];
+
+    TORCH_CHECK(g_im2col3d_fp32 != nil, "Failed to create im2col3d_fp32 pipeline");
+    TORCH_CHECK(g_im2col3d_fp16 != nil, "Failed to create im2col3d_fp16 pipeline");
+    TORCH_CHECK(g_col2im3d_fp32 != nil, "Failed to create col2im3d_fp32 pipeline");
+
+    g_initialized.store(true, std::memory_order_release);
 }
 
 // im2col3d: Metal kernel to extract patches
@@ -284,21 +316,27 @@ torch::Tensor im2col3d_mps(
     int col_height = batch * out_depth * out_height * out_width;
     int col_width = in_channels * kernel_d * kernel_h * kernel_w;
 
-    auto input_contig = input.contiguous();
-    auto col = torch::empty({col_height, col_width}, input_contig.options());
+    // Handle BF16: convert to FP32 for kernel (no native BF16 im2col kernel)
+    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
+    auto input_work = input.contiguous();
+    if (is_bfloat16) {
+        input_work = input_work.to(at::kFloat);
+    }
 
-    id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_contig);
+    auto col = torch::empty({col_height, col_width}, input_work.options());
+
+    id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_work);
     id<MTLBuffer> col_buf = at::native::mps::getMTLBufferStorage(col);
 
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        id<MTLComputePipelineState> pso = (input_contig.scalar_type() == at::kHalf)
+        id<MTLComputePipelineState> pso = (input_work.scalar_type() == at::kHalf)
             ? g_im2col3d_fp16 : g_im2col3d_fp32;
 
         [encoder setComputePipelineState:pso];
-        [encoder setBuffer:input_buf offset:input_contig.storage_offset() * input_contig.element_size() atIndex:0];
+        [encoder setBuffer:input_buf offset:input_work.storage_offset() * input_work.element_size() atIndex:0];
         [encoder setBuffer:col_buf offset:0 atIndex:1];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:2];
@@ -328,6 +366,11 @@ torch::Tensor im2col3d_mps(
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     }
 
+    // Convert back to BF16 if needed
+    if (is_bfloat16) {
+        col = col.to(at::kBFloat16);
+    }
+
     return col;
 }
 
@@ -343,6 +386,14 @@ torch::Tensor conv3d_forward_mps(
     TORCH_CHECK(input.device().type() == torch::kMPS, "input must be on MPS");
     TORCH_CHECK(weight.device().type() == torch::kMPS, "weight must be on MPS");
     TORCH_CHECK(groups == 1, "groups > 1 not yet supported in im2col path");
+
+    // Parameter validation
+    TORCH_CHECK(stride_d > 0 && stride_h > 0 && stride_w > 0,
+        "stride must be positive, got (", stride_d, ", ", stride_h, ", ", stride_w, ")");
+    TORCH_CHECK(dilation_d > 0 && dilation_h > 0 && dilation_w > 0,
+        "dilation must be positive, got (", dilation_d, ", ", dilation_h, ", ", dilation_w, ")");
+    TORCH_CHECK(pad_d >= 0 && pad_h >= 0 && pad_w >= 0,
+        "padding must be non-negative, got (", pad_d, ", ", pad_h, ", ", pad_w, ")");
 
     int batch = input.size(0);
     int out_channels = weight.size(0);

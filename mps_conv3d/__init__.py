@@ -10,8 +10,12 @@ from torch import nn, Tensor
 from torch.autograd import Function
 from typing import Optional, Tuple, Union
 import torch.nn.functional as F
+import threading
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
+
+# Thread-safe library loading
+_lib_lock = threading.Lock()
 
 
 def _load_library():
@@ -38,10 +42,46 @@ _lib_cache = None
 
 
 def _get_lib():
+    """Thread-safe library loading."""
     global _lib_cache
     if _lib_cache is None:
-        _lib_cache = _load_library()
+        with _lib_lock:
+            # Double-check after acquiring lock
+            if _lib_cache is None:
+                _lib_cache = _load_library()
     return _lib_cache
+
+
+def _validate_conv_params(
+    stride: Tuple[int, int, int],
+    padding: Tuple[int, int, int],
+    dilation: Tuple[int, int, int],
+) -> None:
+    """Validate convolution parameters."""
+    if any(s <= 0 for s in stride):
+        raise ValueError(f"stride must be positive, got {stride}")
+    if any(d <= 0 for d in dilation):
+        raise ValueError(f"dilation must be positive, got {dilation}")
+    if any(p < 0 for p in padding):
+        raise ValueError(f"padding must be non-negative, got {padding}")
+
+
+def _validate_groups(in_channels: int, out_channels: int, groups: int) -> None:
+    """Validate groups parameter."""
+    if groups <= 0:
+        raise ValueError(f"groups must be positive, got {groups}")
+    if in_channels % groups != 0:
+        raise ValueError(f"in_channels ({in_channels}) must be divisible by groups ({groups})")
+    if out_channels % groups != 0:
+        raise ValueError(f"out_channels ({out_channels}) must be divisible by groups ({groups})")
+
+
+def _check_tensor_device(tensor: Tensor, name: str, expected_device: torch.device) -> None:
+    """Check that tensor is on the expected device."""
+    if tensor.device != expected_device:
+        raise ValueError(
+            f"{name} must be on same device as input ({expected_device}), got {tensor.device}"
+        )
 
 
 class _Conv3DFunction(Function):
@@ -58,6 +98,11 @@ class _Conv3DFunction(Function):
         dilation: Tuple[int, int, int],
         groups: int,
     ) -> Tensor:
+        # Device validation
+        _check_tensor_device(weight, "weight", input.device)
+        if bias is not None:
+            _check_tensor_device(bias, "bias", input.device)
+
         ctx.save_for_backward(input, weight, bias)
         ctx.stride = stride
         ctx.padding = padding
@@ -81,6 +126,11 @@ class _Conv3DFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         input, weight, bias = ctx.saved_tensors
+
+        # Device validation for backward
+        if not grad_output.device.type == "mps":
+            raise ValueError(f"grad_output must be on MPS device, got {grad_output.device}")
+
         lib = _get_lib()
 
         grad_input = grad_weight = grad_bias = None
@@ -139,13 +189,16 @@ def conv3d(
         input: Input tensor (N, C_in, D, H, W)
         weight: Weight tensor (C_out, C_in/groups, kD, kH, kW)
         bias: Optional bias tensor (C_out,)
-        stride: Stride of convolution
-        padding: Padding added to input
-        dilation: Dilation of kernel
-        groups: Number of groups
+        stride: Stride of convolution (must be positive)
+        padding: Padding added to input (must be non-negative)
+        dilation: Dilation of kernel (must be positive)
+        groups: Number of groups (must be positive)
 
     Returns:
         Output tensor (N, C_out, D_out, H_out, W_out)
+
+    Raises:
+        ValueError: If tensors not on MPS or parameters invalid.
     """
     if input.device.type != "mps":
         # Fallback to PyTorch for non-MPS
@@ -154,6 +207,13 @@ def conv3d(
     stride = _normalize_tuple(stride, 3, "stride")
     padding = _normalize_tuple(padding, 3, "padding")
     dilation = _normalize_tuple(dilation, 3, "dilation")
+
+    # Validate parameters
+    _validate_conv_params(stride, padding, dilation)
+
+    in_channels = input.size(1)
+    out_channels = weight.size(0)
+    _validate_groups(in_channels, out_channels, groups)
 
     return _Conv3DFunction.apply(
         input.contiguous(), weight.contiguous(), bias,

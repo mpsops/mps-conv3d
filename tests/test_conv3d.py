@@ -9,6 +9,110 @@ from mps_conv3d import conv3d, Conv3d, is_available
 
 print(f"MPS available: {is_available()}")
 
+
+# =============================================================================
+# Validation Tests
+# =============================================================================
+
+def test_stride_validation():
+    """Test that stride<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, D, H, W = 1, 4, 4, 4, 4
+    C_out = 4
+    K = 3
+
+    input = torch.randn(B, C_in, D, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, K, device='mps', dtype=torch.float32)
+
+    try:
+        conv3d(input, weight, stride=0, padding=1)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "stride" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  stride=0 correctly rejected")
+        return True
+    return False
+
+
+def test_dilation_validation():
+    """Test that dilation<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, D, H, W = 1, 4, 4, 4, 4
+    C_out = 4
+    K = 3
+
+    input = torch.randn(B, C_in, D, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, K, device='mps', dtype=torch.float32)
+
+    try:
+        conv3d(input, weight, stride=1, padding=1, dilation=0)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "dilation" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  dilation=0 correctly rejected")
+        return True
+    return False
+
+
+def test_padding_validation():
+    """Test that negative padding raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, D, H, W = 1, 4, 4, 4, 4
+    C_out = 4
+    K = 3
+
+    input = torch.randn(B, C_in, D, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, K, device='mps', dtype=torch.float32)
+
+    try:
+        conv3d(input, weight, stride=1, padding=-1)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "padding" in str(e).lower() and "non-negative" in str(e).lower()
+        print(f"  negative padding correctly rejected")
+        return True
+    return False
+
+
+def test_groups_validation():
+    """Test that invalid groups raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, D, H, W = 1, 5, 4, 4, 4  # 5 channels not divisible by 2
+    C_out = 4
+    K = 3
+
+    input = torch.randn(B, C_in, D, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in // 2, K, K, K, device='mps', dtype=torch.float32)
+
+    try:
+        conv3d(input, weight, stride=1, padding=1, groups=2)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "divisible" in str(e).lower() or "groups" in str(e).lower()
+        print(f"  invalid groups correctly rejected")
+        return True
+    return False
+
+
+def test_device_mismatch():
+    """Test that weight on different device raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, D, H, W = 1, 4, 4, 4, 4
+    C_out = 4
+    K = 3
+
+    input = torch.randn(B, C_in, D, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, K, device='cpu', dtype=torch.float32)  # CPU!
+
+    try:
+        conv3d(input, weight, stride=1, padding=1)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "device" in str(e).lower()
+        print(f"  device mismatch correctly rejected")
+        return True
+    return False
+
 def test_forward(dtype, name):
     """Test forward pass"""
     torch.manual_seed(42)
@@ -225,6 +329,13 @@ if __name__ == "__main__":
     print("=" * 50)
 
     all_ok = True
+
+    print("\n0. Validation tests:")
+    all_ok &= test_stride_validation()
+    all_ok &= test_dilation_validation()
+    all_ok &= test_padding_validation()
+    all_ok &= test_groups_validation()
+    all_ok &= test_device_mismatch()
 
     print("\n1. Forward pass:")
     all_ok &= test_forward(torch.float32, "FP32")
